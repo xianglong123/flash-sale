@@ -1,0 +1,19 @@
+# Java
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# 本地配置与日志
+application-local.yml
+logs/
+*.log
