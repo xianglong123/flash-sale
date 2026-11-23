@@ -46,6 +46,18 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ErrorCode.BAD_REQUEST.status()).body(body);
     }
 
+    /**
+     * P0-001 修复点：缓存层不可用属于「依赖降级」，必须返回 503 让客户端稍后重试，
+     * 而不是 500（500 的语义是服务端 bug，会误导调用方和告警）。
+     */
+    @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+    public ResponseEntity<Result<Object>> onDependencyDown(Exception e) {
+        log.error("[DEGRADE] 依赖访问失败，降级为 503: {}", e.toString());
+        Result<Object> body = Result.fail(ErrorCode.SYSTEM_NOT_READY.name(), "缓存层不可用，请稍后重试");
+        body.setTraceId(MDC.get(TraceIdFilter.TRACE));
+        return ResponseEntity.status(ErrorCode.SYSTEM_NOT_READY.status()).body(body);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Result<Object>> onOther(Exception e) {
         log.error("[FAIL] unexpected error", e);
