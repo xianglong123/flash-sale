@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>闪购秒杀 · 展示页</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --line:#e4e6eb; --txt:#1a1c20; --sub:#6b7280; --key:#e4393c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:680px; margin:0 auto; padding:24px 16px 48px; }
+  .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+  .top h1 { font-size:18px; margin:0; letter-spacing:.5px; }
+  .top a { font-size:13px; color:var(--sub); text-decoration:none; border:1px solid var(--line);
+           padding:6px 12px; border-radius:8px; background:#fff; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  .name { font-size:20px; font-weight:600; margin-bottom:6px; }
+  .price { color:var(--key); font-size:28px; font-weight:700; margin-bottom:16px; }
+  .price small { font-size:14px; font-weight:400; }
+  .bar { height:10px; background:#f0f1f3; border-radius:6px; overflow:hidden; margin-bottom:8px; }
+  .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,#ff7a45,#e4393c);
+             transition:width .35s ease; }
+  .row { display:flex; justify-content:space-between; font-size:13px; color:var(--sub); margin-bottom:14px; }
+  .row b { color:var(--txt); }
+  .cd { font-size:14px; color:var(--sub); margin-bottom:16px; }
+  .cd b { color:var(--key); font-variant-numeric:tabular-nums; }
+  button.buy { width:100%; padding:14px; border:0; border-radius:10px; font-size:16px; font-weight:600;
+               color:#fff; background:var(--key); cursor:pointer; }
+  button.buy:disabled { background:#c9ccd1; cursor:not-allowed; }
+  .msg { min-height:20px; margin-top:12px; font-size:13px; text-align:center; }
+  .msg.err { color:var(--key); } .msg.ok { color:#0a7d33; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  ul { list-style:none; margin:0; padding:0; }
+  ul li { display:flex; justify-content:space-between; font-size:13px; color:var(--sub);
+          padding:8px 0; border-bottom:1px dashed var(--line); }
+  ul li:last-child { border-bottom:0; }
+  .empty { color:var(--sub); font-size:13px; }
+  .pill { display:inline-block; font-size:12px; padding:2px 8px; border-radius:6px; background:#f0f1f3; color:var(--sub); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>闪购秒杀 <span class="pill" id="statusPill">加载中</span></h1>
+    <a href="/admin.html">管理端 →</a>
+  </div>
+
+  <div class="card">
+    <div class="name" id="itemName">--</div>
+    <div class="price"><small>¥</small><span id="price">--</span></div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="row"><span>已售 <b id="sold">0</b></span><span>剩余 <b id="left">0</b> / <b id="total">0</b></span></div>
+    <div class="cd" id="countdown">--</div>
+    <button class="buy" id="buyBtn" disabled>加载中</button>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>最近成交</h2>
+    <ul id="recent"></ul>
+    <div class="empty" id="empty">暂无成交</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const seckillId = params.get('id') || '1';
+  const base = '';
+  let offset = 0;          // 本机时间 - 服务端时间
+  let last = null;         // 最后一次成功数据
+  let timer = null;
+
+  // 演示用身份：本地持久化，仅用于幂等校验
+  let uid = localStorage.getItem('fs_uid');
+  if (!uid) { uid = String(Math.floor(100000 + Math.random() * 900000)); localStorage.setItem('fs_uid', uid); }
+
+  const $ = (id) => document.getElementById(id);
+  const MSG = {
+    SOLD_OUT: '手慢了，已售罄',
+    ALREADY_PARTICIPATED: '你已经抢到过了',
+    RATE_LIMITED: '点太快了，喘口气',
+    NOT_IN_WINDOW: '不在活动时间内',
+    SYSTEM_NOT_READY: '活动还在准备中',
+    SYSTEM_BUSY: '系统繁忙，稍后再试',
+    INTERNAL_ERROR: '服务异常，请联系管理员',
+    UNAUTHORIZED: '缺少用户身份'
+  };
+
+  function fmtGap(ms) {
+    if (ms < 0) ms = 0;
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${pad(h)}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+  }
+
+  function renderCountdown() {
+    if (!last) return;
+    const now = Date.now() - offset;
+    const start = new Date(last.startTime).getTime();
+    const end = new Date(last.endTime).getTime();
+    const el = $('countdown');
+    if (last.status === 'ENDED') { el.textContent = '活动已结束'; return; }
+    if (now < start) { el.innerHTML = `距开始 <b>${fmtGap(start - now)}</b>`; return; }
+    if (now <= end) { el.innerHTML = `距结束 <b>${fmtGap(end - now)}</b>`; return; }
+    el.textContent = '活动已结束';
+  }
+
+  function render(d) {
+    last = d;
+    $('itemName').textContent = d.itemName;
+    $('price').textContent = Number(d.price).toFixed(2);
+    $('total').textContent = d.totalStock;
+    $('left').textContent = d.availableStock;
+    $('sold').textContent = d.soldCount;
+    const pct = d.totalStock > 0 ? Math.min(100, (d.soldCount / d.totalStock) * 100) : 0;
+    $('bar').style.width = pct.toFixed(1) + '%';
+
+    const pill = $('statusPill');
+    const label = { NOT_STARTED: '未开始', ONGOING: '进行中', ENDED: '已结束' }[d.status] || d.status;
+    pill.textContent = label;
+
+    const btn = $('buyBtn');
+    if (d.status === 'NOT_STARTED') { btn.disabled = true; btn.textContent = '即将开始'; }
+    else if (d.status === 'ENDED') { btn.disabled = true; btn.textContent = '活动已结束'; }
+    else if (d.availableStock <= 0) { btn.disabled = true; btn.textContent = '已售罄'; }
+    else { btn.disabled = false; btn.textContent = '立即抢购'; }
+
+    const ul = $('recent');
+    ul.innerHTML = '';
+    const list = d.recentOrders || [];
+    $('empty').style.display = list.length ? 'none' : 'block';
+    list.forEach((o) => {
+      const li = document.createElement('li');
+      li.innerHTML = `<span>${o.userMasked}</span><span>${(o.createdAt || '').replace('T', ' ')}</span>`;
+      ul.appendChild(li);
+    });
+
+    renderCountdown();
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch(`${base}/api/seckill/${seckillId}/stats`, { cache: 'no-store' });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.message || '请求失败');
+      offset = Date.now() - new Date(body.data.serverTime).getTime();
+      render(body.data);
+      $('msg').textContent = '';
+      $('msg').className = 'msg';
+    } catch (e) {
+      // 失败不清空上一次数据，只提示
+      $('msg').className = 'msg err';
+      $('msg').textContent = '连接异常，正在重试…';
+    }
+  }
+
+  $('buyBtn').addEventListener('click', async () => {
+    const btn = $('buyBtn');
+    btn.disabled = true;
+    btn.textContent = '抢购中…';
+    $('msg').textContent = '';
+    try {
+      const res = await fetch(`${base}/api/seckill/${seckillId}/order`, {
+        method: 'POST',
+        headers: { 'X-User-Id': uid }
+      });
+      const body = await res.json();
+      if (res.ok) {
+        $('msg').className = 'msg ok';
+        $('msg').textContent = `抢到了！订单号 ${body.data.orderNo}`;
+      } else {
+        $('msg').className = 'msg err';
+        $('msg').textContent = MSG[body.code] || body.message || '抢购失败';
+      }
+    } catch (e) {
+      $('msg').className = 'msg err';
+      $('msg').textContent = '网络异常，请重试';
+    } finally {
+      setTimeout(poll, 600);
+    }
+  });
+
+  $('buyBtn').dataset.uid = uid;
+  poll();
+  timer = setInterval(poll, 1500);
+  setInterval(renderCountdown, 1000);
+})();
+</script>
+</body>
+</html>

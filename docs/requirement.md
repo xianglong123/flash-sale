@@ -4,11 +4,12 @@
 | --- | --- |
 | 项目名 | flash-sale |
 | 语言/框架 | Java 17 + Spring Boot 3.2.x |
-| 存储 | MariaDB 10.x 或 MySQL 5.7（按服务器可用源选择）+ Redis 5.x |
+| 存储 | MySQL 9.0.1（本地 127.0.0.1:3306）+ Redis 7.2.6 |
+| ORM | MyBatis-Plus 3.5.7（`mybatis-plus-spring-boot3-starter`） |
 | 压测 | k6（脚本化，可纳入仓库） |
-| 部署目标 | 云主机 CentOS 7 / 2 核 1.7G / 无 Docker |
+| 部署目标 | 本地 macOS 单机（v2 的云主机方案已作废，见第 12 节说明） |
 | 前端 | 单页 HTML + 原生 JS，无构建、无框架 |
-| 文档版本 | v2（相对 v1 增加管理端、展示页、部署与环境约束） |
+| 文档版本 | v3（v2 基础上确定 ORM 选型、数据库与本机运行范围） |
 | 本文档的作用 | 既是开发需求，也是 AI 编码的约束合同和验收标准 |
 
 > **v2 变更摘要**
@@ -551,7 +552,7 @@ Header: X-Admin-Token
 
 ## 11. 需要项目负责人确认的事
 
-- [ ] ORM 用 JPA 还是 MyBatis（默认 JPA）
+- [x] ORM 用 JPA 还是 MyBatis → **已定 MyBatis-Plus 3.5.7**（v3）
 - [ ] 部署形态：jar + systemd + nginx 反代（不用 Docker），是否确认
 - [ ] 数据库选型：MariaDB 10.x 还是 MySQL 5.7（按服务器可用源）
 - [ ] 演示域名用哪个（443 由现有 nginx 接管）
@@ -560,7 +561,9 @@ Header: X-Admin-Token
 
 ---
 
-## 12. 部署与环境约束（v2 新增）
+## 12. 部署与环境约束（v3 标注：已作废）
+
+> **v3 变更**：用户已决定只在本地 macOS 运行、不上服务器、不用 Docker。本节保留为历史决策记录，不再作为本版验收依据；对应的 9.5 部署验收同步作废。
 
 ### 12.1 目标机器现状（实测）
 
