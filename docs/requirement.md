@@ -4,11 +4,19 @@
 | --- | --- |
 | 项目名 | flash-sale |
 | 语言/框架 | Java 17 + Spring Boot 3.2.x |
-| 存储 | MySQL 8.0 + Redis 7.x |
+| 存储 | MariaDB 10.x 或 MySQL 5.7（按服务器可用源选择）+ Redis 5.x |
 | 压测 | k6（脚本化，可纳入仓库） |
-| 部署目标 | 第一期本地单机，不上云 |
-| 文档版本 | v1 |
+| 部署目标 | 云主机 CentOS 7 / 2 核 1.7G / 无 Docker |
+| 前端 | 单页 HTML + 原生 JS，无构建、无框架 |
+| 文档版本 | v2（相对 v1 增加管理端、展示页、部署与环境约束） |
 | 本文档的作用 | 既是开发需求，也是 AI 编码的约束合同和验收标准 |
+
+> **v2 变更摘要**
+> 1. 增加管理端（设库存、开/停活动）与展示页（实时售卖情况）
+> 2. 管理端必须鉴权（公网暴露，不鉴权等于谁都能改库存）
+> 3. 库存调整规则：进行中只允许增加，禁止减少
+> 4. 并发验收拆成「压测环境（本地）」与「演示环境（服务器）」
+> 5. 新增第 12 节：部署形态、内存预算、swap 要求
 
 ---
 
@@ -16,8 +24,8 @@
 
 | 阶段 | 范围 | 验收门槛 |
 | --- | --- | --- |
-| P0 | 活动查询 + 下单主链路（Redis 预扣 + DB 落库）+ 幂等 + 限流 | 1000 库存 / 10000 并发不超卖不少卖 |
-| P1 | 订单状态机 + 超时未支付回补 + 管理端活动配置 | 回补不产生负库存、不产生重复订单 |
+| P0 | 活动查询 + 下单主链路（Redis 预扣 + DB 落库）+ 幂等 + 限流 + **管理端 + 展示页** | 1000 库存 / 10000 并发不超卖不少卖（本地压测）；服务器上功能全部可用 |
+| P1 | 订单状态机 + 超时未支付回补 | 回补不产生负库存、不产生重复订单 |
 | P2 | 压测报告 + 热点优化 + 故障演练 | P99 达标、依赖不可用时行为正确 |
 
 **P0 不通过验收，不允许开始 P1。** 每阶段结束提交一次验收报告。
@@ -55,16 +63,24 @@
 
 **范围类**
 
-- 禁止自行扩展功能：不做购物车、不做优惠券、不做支付对接（支付用 mock 接口）、不做用户注册登录体系（用 header 传 userId）。
+- 禁止自行扩展功能：不做购物车、不做优惠券、不做支付对接（支付用 mock 接口）、不做用户注册登录体系（下单侧用 header 传 userId）。
 - 禁止改动数据库表结构以外的任何配置文件默认值（连接池大小等改动必须在 PR 说明里写原因）。
 - 禁止在 `entity` 层加入业务逻辑。
+
+**前端类**
+
+- 只允许纯 HTML + 原生 JS + `fetch`，**禁止引入任何前端框架与构建工具**（React / Vue / Vite / npm 一律不加）。
+- 禁止前端内联大段业务判断逻辑（限流、库存判断必须由后端返回结果，前端只做展示）。
+- 禁止在前端暴露 `admin` token 明文（见 7.4）。
 
 ### 1.4 明确不做
 
 - 不做分布式事务
 - 不做多机房
 - 不做风控模型（只做简单的频率限制）
-- 不做前端页面（只提供 REST 接口 + Swagger）
+- 不做用户登录注册（管理端用固定 token，下单端用 header）
+- 不做移动端适配（桌面浏览器即可）
+- 不做支付真实对接（mock）
 
 ---
 
@@ -98,6 +114,43 @@
 
 活动状态：`NOT_STARTED` / `ONGOING` / `ENDED` / `SOLD_OUT`
 订单状态：`PENDING_PAY` / `PAID` / `TIMEOUT_CANCELLED`
+
+### 2.4 管理端规则（v2 新增）
+
+管理端通过前端表单操作，后端提供接口。**所有管理端接口必须鉴权**（见 7.4）。
+
+#### 2.4.1 可执行的操作
+
+| 操作 | 允许的时机 | 规则 |
+| --- | --- | --- |
+| 创建活动（设库存、设时间窗） | 无限制 | `total_stock` 取值 1 ~ 100000，超出返回 400 |
+| 调整库存 | **仅 `NOT_STARTED`** | 可增可减，同时更新 DB 与 Redis |
+| 增加库存 | 允许 `NOT_STARTED` 与 `ONGOING` | Redis `INCRBY` + DB `available_stock += n`，两步顺序必须是**先 Redis 后 DB** |
+| 减少库存 | **禁止**，任何时候都不允许 | 返回 400 `STOCK_DECREASE_FORBIDDEN` |
+| 开始活动 | `NOT_STARTED` | 把时间窗改成 `now ~ now+duration`，并预热 Redis |
+| 结束活动 | `ONGOING` | 状态置 `ENDED`，Redis 库存 key 保留不删 |
+| 查看实时数据 | 任何时候 | 见 2.4.3 |
+
+#### 2.4.2 为什么禁止减少库存
+
+减少库存会让“已经卖出的数量”超过“库存”，一旦发生就是超卖。即使当前还没卖完，减库存也会让 `available_stock` 与已售数之和超过 `total_stock`，历史数据从此不自洽。
+
+需要“少卖”就把活动结束掉，不要动库存数字。
+
+#### 2.4.3 展示页要求
+
+展示页（`/`）面向观众，只读，不需要鉴权，必须展示：
+
+- 商品名、单价
+- 库存进度条（已售 / 总量）
+- 剩余数量（数字）
+- 已售数量（数字）
+- 最近 10 条成功订单（用户 ID 脱敏，只显示后 4 位 + 时间）
+- 活动状态与倒计时
+
+数据通过轮询获取，**轮询间隔 1500ms**，不允许用 WebSocket（复杂度不值得）。
+
+管理页（`/admin`）必须展示：全部活动列表、当前库存、已售数、一键开始/结束。
 
 ---
 
@@ -154,6 +207,9 @@ UNIQUE KEY uk_user_seckill (user_id, seckill_id)
 | `seckill:user:{seckillId}` | Set | 已下单 user_id 集合 | 同上 |
 | `seckill:meta:{seckillId}` | Hash | 活动起止时间、状态、总库存 | 同上 |
 | `seckill:rate:{userId}:{seckillId}` | String | 计数器 | 1 秒 |
+| `seckill:recent:{seckillId}` | List | 最近 10 条成功订单摘要（LPUSH + LTRIM） | 结束 + 24h |
+
+> `seckill:recent` 只存脱敏摘要（`"****8821|时间戳"`），**不存完整用户信息**，且只在扣减成功后 LPUSH，用于展示页，不参与任何业务判断。
 
 **规则：库存 key 不存在不等于库存为 0。** 活动开始前必须预热；预热失败时活动不可开启（返回「活动未就绪」而不是「已售罄」）。
 
@@ -214,6 +270,65 @@ Header: X-User-Id
 GET /actuator/health  → 200 {"status":"UP"}
 ```
 
+### 4.5 展示接口（v2 新增，匿名可访问）
+
+```
+GET /api/seckill/{seckillId}/stats
+
+200 {
+  "seckillId": 1,
+  "status": "ONGOING",
+  "totalStock": 1000,
+  "availableStock": 873,
+  "soldCount": 127,
+  "startTime": "...",
+  "endTime": "...",
+  "serverTime": "...",
+  "recentOrders": [
+    { "userMasked": "****8821", "createdAt": "2026-11-23T18:20:01" }
+  ]
+}
+```
+
+- `soldCount` = `totalStock - availableStock`，从 Redis 实时算，不查 DB
+- `recentOrders` 最多 10 条，来自 Redis List `seckill:recent:{id}`（LPUSH + LTRIM 保持 10 条）
+- `userMasked` 只保留后 4 位，**禁止返回完整 user_id**
+
+### 4.6 管理端接口（v2 新增，全部需要鉴权）
+
+```
+POST /api/admin/seckill
+Header: X-Admin-Token: <token>
+Body: { "itemName": "iPhone 17", "price": 5999.00, "totalStock": 1000, "durationSeconds": 60 }
+201 { "seckillId": 1, "status": "NOT_STARTED" }
+
+PUT /api/admin/seckill/{id}/stock
+Header: X-Admin-Token
+Body: { "totalStock": 1500 }
+200 { "totalStock": 1500, "availableStock": 1500 }
+400 { "code": "STOCK_DECREASE_FORBIDDEN" }   // 进行中减少库存
+
+POST /api/admin/seckill/{id}/start
+Header: X-Admin-Token
+200 { "status": "ONGOING", "startTime": "...", "endTime": "..." }
+
+POST /api/admin/seckill/{id}/end
+Header: X-Admin-Token
+200 { "status": "ENDED" }
+
+GET /api/admin/seckill            // 列表
+Header: X-Admin-Token
+200 [ { "seckillId": 1, "status": "...", "totalStock": 1000, "availableStock": 873 } ]
+
+401 { "code": "UNAUTHORIZED" }    // token 缺失或错误
+```
+
+**管理端接口的特殊约束：**
+
+- 处 `401 UNAUTHORIZED` 外，不允许返回任何其他 401/403 语义
+- 修改库存必须同时更新 Redis 与 DB，顺序为**先 Redis 后 DB**；DB 失败时记 `RECONCILE_REQUIRED`，不回滚 Redis
+- 所有管理操作必须写审计日志：`[ADMIN] action=start seckillId=1 operator=tokenHash`
+
 ---
 
 ## 5. 并发与一致性（本文档的核心）
@@ -222,13 +337,23 @@ GET /actuator/health  → 200 {"status":"UP"}
 
 ### 5.1 并发画像
 
-| 项 | 值 |
+**环境拆分（v2 新增）**：验收分两个环境，指标只对压测环境有效。
+
+| 环境 | 机器 | 用途 | 并发验收 |
+| --- | --- | --- | --- |
+| **压测环境** | 本地 Mac（≥8 核） | 跑 C1~C4 并发验收 | **全部指标以此为准** |
+| **演示环境** | 云主机 2 核 1.7G | 前端操作、功能演示、部署验证 | 只验功能正确，**不验并发** |
+
+演示环境不承担以下任何指标，也不允许拿它跑 10000 并发：2 核 1.7G 的 CPU 会先于应用打满，测出的数字无效，且可能把机器打死（无 swap 时会 OOM）。
+
+| 项 | 值（压测环境） |
 | --- | --- |
 | 目标峰值 QPS | 2000（下单接口） |
 | 并发用户 | 10000，5 秒内到达 |
 | 库存 | 1000 |
 | 预期成功率 | 恰好 1000 单成功，其余全部明确拒绝（不是超时、不是 500） |
 | 接口 P99 | < 200ms（2000 QPS 下） |
+| 演示环境目标 | 50 并发以内功能正确，P99 不设指标 |
 
 ### 5.2 竞态点清单
 
@@ -294,11 +419,25 @@ GET /actuator/health  → 200 {"status":"UP"}
 
 ## 7. 安全
 
-- 认证：无真实认证，`X-User-Id` 由调用方传入；**必须在代码注释中标注这是演示用，不具备真实安全性**
+- 认证（下单侧）：无真实认证，`X-User-Id` 由调用方传入；**必须在代码注释中标注这是演示用，不具备真实安全性**
 - 越权：下单时必须校验 `seckillId` 存在且时间窗有效，不校验 userId 归属（因为本身就是当前用户）
 - 输入校验：`seckillId` 必须为正整数；`X-User-Id` 长度 ≤ 20 位数字；非法输入返回 400，不抛异常
 - 敏感数据：不记录完整请求头；日志中 userId 只记录脱敏值（保留后 4 位）
 - 禁止在 URL 里传输任何密钥
+
+### 7.4 管理端鉴权（v2 新增，硬性要求）
+
+管理端接口暴露在公网 443 端口上，**不鉴权等于任何人都能改库存、终止活动**。因此：
+
+1. 管理端接口统一校验请求头 `X-Admin-Token`，值从环境变量 `ADMIN_TOKEN` 读取，**禁止硬编码在代码或配置文件里提交到仓库**。
+2. token 比对必须使用**定长比较**（避免时序侧信道），不允许 `equals` 直接比。
+3. 校验失败一律返回 `401 UNAUTHORIZED`，**不返回任何关于 token 格式的提示**。
+4. 管理端接口必须额外做 IP 无关的速率限制：**每分钟最多 30 次**，超限返回 429。
+5. 管理页 `/admin` 前端必须让用户手动输入 token（存 `sessionStorage`，不存 localStorage），刷新页面后需重新输入。
+6. `ADMIN_TOKEN` 长度要求 ≥ 32 字符，部署时用 `openssl rand -hex 32` 生成。
+7. **禁止把 token 打进任何日志**，审计日志里只记录 token 的 SHA-256 前 8 位。
+
+> 若 `ADMIN_TOKEN` 未配置，应用启动失败（fail-fast），不允许以“无鉴权”状态运行。
 
 ---
 
@@ -364,12 +503,36 @@ GET /actuator/health  → 200 {"status":"UP"}
 | E2 | 先扣 Redis 再断开 MySQL（模拟） | 不产生超卖；产生 1 条 RECONCILE_REQUIRED 日志 |
 | E3 | 配置 `seckill.enabled=false` | 所有下单返回 503 |
 
-### 9.4 交付物清单
+### 9.4 管理端与前端验收（v2 新增）
+
+| 编号 | 场景 | 期望 | 判定 |
+| --- | --- | --- | --- |
+| A1 | 不带 token 调管理端接口 | 401 UNAUTHORIZED | curl |
+| A2 | 带错误 token | 401，响应体不含任何 token 格式提示 | curl |
+| A3 | 创建活动，库存设 0 或 100001 | 400 | curl |
+| A4 | 活动进行中，调减库存接口 | 400 STOCK_DECREASE_FORBIDDEN，Redis 与 DB 数值均未变 | curl + SQL |
+| A5 | 活动进行中，调增库存 +500 | Redis 库存 +500，DB `available_stock` +500，两个数字一致 | redis-cli + SQL |
+| A6 | 管理页点「开始」 | 状态变 ONGOING，Redis 库存 key 存在 | 浏览器点击 |
+| A7 | 展示页轮询 | 库存数字每 1.5 秒刷新，售罄后显示 SOLD_OUT | 浏览器观察 |
+
+### 9.5 部署验收（v2 新增，在演示环境执行）
+
+| 编号 | 场景 | 期望 |
+| --- | --- | --- |
+| D1 | `curl https://<域名>/actuator/health` | 200，`{"status":"UP"}` |
+| D2 | 浏览器访问 `https://<域名>/` | 展示页正常渲染，轮询有数据 |
+| D3 | 浏览器访问 `https://<域名>/admin` | 页面可打开，未输入 token 时接口返回 401 |
+| D4 | 重启服务器后 | 应用自动启动（systemd enabled），健康检查恢复 UP |
+| D5 | 压测 50 并发 10 秒 | 无 500，成功 + 售罄数量 = 库存总量 |
+
+### 9.6 交付物清单
 
 - `docs/requirement.md`（本文件）
-- `README.md`：启动方式、压测方式、排查路径
+- `README.md`：启动方式、压测方式、排查路径、部署步骤
 - `loadtest/k6-seckill.js`：C1~C4 的可执行脚本
-- `docs/report-P0.md`：含 k6 报告截图 + SQL 核对结果
+- `docs/report-P0.md`：含 k6 报告 + SQL 核对结果 + 前端截图
+- 前端静态文件：`src/main/resources/static/index.html`、`static/admin.html`
+- `deploy/` 目录：systemd unit、nginx 配置片段、部署脚本
 - Swagger 可访问（`/swagger-ui.html`）
 
 ---
@@ -388,8 +551,68 @@ GET /actuator/health  → 200 {"status":"UP"}
 
 ## 11. 需要项目负责人确认的事
 
-- [ ] 技术栈版本：JDK 17 / Spring Boot 3.2.x / MySQL 8 / Redis 7
-- [ ] ORM 用 JPA 还是 MyBatis（本需求默认 JPA，如需 MyBatis 需改禁止项里的依赖白名单）
-- [ ] 压测工具用 k6（本地需安装）
-- [ ] 是否第一期就用 Docker Compose 起 MySQL + Redis
-- [ ] P0 的目标 QPS 是否就按 2000（本地单机的现实上限）
+- [ ] ORM 用 JPA 还是 MyBatis（默认 JPA）
+- [ ] 部署形态：jar + systemd + nginx 反代（不用 Docker），是否确认
+- [ ] 数据库选型：MariaDB 10.x 还是 MySQL 5.7（按服务器可用源）
+- [ ] 演示域名用哪个（443 由现有 nginx 接管）
+- [ ] 内存预算与 swap 方案（见第 12 节），是否接受
+- [ ] 管理端 token 由你生成并配置到服务器环境变量
+
+---
+
+## 12. 部署与环境约束（v2 新增）
+
+### 12.1 目标机器现状（实测）
+
+| 项 | 实际值 | 影响 |
+| --- | --- | --- |
+| 系统 | CentOS Linux 7（已 EOL） | 官方 yum 源已下线，装包需切 vault 源 |
+| CPU | 2 核 | 只够演示，不够压测 |
+| 内存 | 1.76 GB，可用 891 MB，**无 swap** | 必须加 swap，否则 OOM |
+| 磁盘 | 40 GB，已用 8 GB | 充足 |
+| Java | 未安装 | 用 tarball 装，不走 yum |
+| MySQL / Redis | 均未安装 | 需安装并调小内存 |
+| Docker | 未安装 | 不使用 Docker |
+| nginx | 1.20.1，占用 80/443 | 复用，反代到 127.0.0.1:8080 |
+
+### 12.2 部署形态（硬性约束）
+
+- **不使用 Docker**，不使用 Docker Compose
+- 应用以 jar 形式运行，由 `systemd` 托管，开机自启
+- 应用只监听 `127.0.0.1:8080`，**不监听 0.0.0.0**，公网不可直连
+- 对外只通过 nginx 80/443 暴露；80 强制跳 443
+- 服务器上不安装 Maven、不编译代码；构建在本地完成，只上传 jar
+
+### 12.3 内存预算（必须按此配置，否则 OOM）
+
+| 组件 | 限制 | 配置方式 |
+| --- | --- | --- |
+| JVM | `-Xmx256m -Xms128m -XX:MaxMetaspaceSize=96m` | systemd `ExecStart` 参数 |
+| MariaDB/MySQL | `innodb_buffer_pool_size=96M`，`max_connections=50` | my.cnf |
+| Redis | `maxmemory 48mb`，`maxmemory-policy allkeys-lru` | redis.conf |
+| swap | 新增 2 GB swap 文件 | 见 12.4 |
+| 预估合计 | 约 780 MB | 留约 100 MB 余量 |
+
+### 12.4 必须执行的前置动作
+
+1. 创建 2 GB swap 文件并启用，写入 `/etc/fstab`
+2. 若 yum 安装失败，先切换 vault 源（**改动前备份原有 repo 文件**）
+3. 防火墙只保留 22 / 80 / 443，8080 不对外开放
+
+### 12.5 部署前置检查（D0）
+
+上线前逐条确认，任一不满足则不上线：
+
+- [ ] `java -version` 输出 17
+- [ ] `systemctl is-active mariadb`（或 mysql）为 active
+- [ ] `redis-cli ping` 返回 PONG
+- [ ] `swapon --show` 有 2 GB
+- [ ] `ss -tlnp | grep 8080` 只显示 127.0.0.1
+- [ ] `ADMIN_TOKEN` 已写入 systemd 环境变量，长度 ≥ 32
+- [ ] nginx 配置已备份，且 `nginx -t` 通过
+
+### 12.6 不做什么
+
+- 不做蓝绿部署、不做滚动发布（单机无意义）
+- 不做容器化改造
+- 不做 CI/CD 自动部署（P0 阶段手动 scp + restart 即可，但要写进 README）
